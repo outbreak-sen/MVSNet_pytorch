@@ -4,6 +4,8 @@
 
 This is an unofficial Pytorch implementation of MVSNet
 
+经过西北工业大学某不知名研究生的修改
+
 ## How to Use
 
 ### Environment
@@ -17,11 +19,11 @@ This is an unofficial Pytorch implementation of MVSNet
 * create a logdir called ``checkpoints``
 * Train MVSNet: ``./train.sh``
 
-### Testing
+### Evaling
 
 * Download the preprocessed test data [DTU testing data](https://drive.google.com/open?id=135oKPefcPTsdtLRzoDAQtPpHuoIrpRI_) (from [Original MVSNet](https://github.com/YoYo000/MVSNet)) and unzip it as the ``DTU_TESTING`` folder, which should contain one ``cams`` folder, one ``images`` folder and one ``pair.txt`` file.
-* in ``test.sh``, set ``DTU_TESTING`` as your testing data path and ``CKPT_FILE`` as your checkpoint file. You can also download my [pretrained model](https://drive.google.com/file/d/1j2I_LNKb9JeCl6wdA7hh8z1WgVQZfLU9/view?usp=sharing).
-* Test MVSNet: ``./test.sh``
+* in ``eval.sh``, set ``DTU_TESTING`` as your testing data path and ``CKPT_FILE`` as your checkpoint file. You can also download my [pretrained model](https://drive.google.com/file/d/1j2I_LNKb9JeCl6wdA7hh8z1WgVQZfLU9/view?usp=sharing).
+* Test MVSNet: ``./eval.sh``
 
 ### Fusion
 
