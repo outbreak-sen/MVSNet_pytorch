@@ -21,6 +21,7 @@ class MVSDataset(Dataset):
         self.nviews = nviews
         self.ndepths = ndepths
         self.interval_scale = interval_scale
+        self.reversemodel = False
 
         assert self.mode in ["train", "val", "test"]
         self.metas = self.build_list()
@@ -96,12 +97,20 @@ class MVSDataset(Dataset):
             return conf
         else:
             return None
-
+    def set_pair_reverse_model(self,reverse_model,N = None):
+        if N is not None:
+            self.nviews = N
+        self.reversemodel = reverse_model
+        
+        
     def __getitem__(self, idx):
         meta = self.metas[idx]
         scan, light_idx, ref_view, src_views = meta
         # use only the reference view and first nviews-1 source views
-        view_ids = [ref_view] + src_views[:self.nviews - 1]
+        if not self.reversemodel:
+            view_ids = [ref_view] + src_views[:self.nviews - 1]
+        else:
+            view_ids = [ref_view] + src_views[len(src_views)-self.nviews +1:-1]
 
         imgs = []
         mask = None
