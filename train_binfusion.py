@@ -204,13 +204,9 @@ def depth_from_prob(prob, depth_bins):
         # 如果已经是 (B, num_bins, 1, 1) 或类似形状
         depth_bins_expanded = depth_bins
     
-    # 使用实际的深度区间而不是线性插值
-    # depth_bins_expanded 已经是每个bin的实际深度值
-    
     # 计算期望深度（期望值）
     prob_soft = F.softmax(prob, dim=1)  # 归一化概率分布
     depth_est = (prob_soft * depth_bins_expanded).sum(dim=1)
-    
     return depth_est
 
 @torch.no_grad()
@@ -220,10 +216,11 @@ def mvsnet_inference(sample):
     imgs = sample_cuda["imgs"]
     proj_matrices = sample_cuda["proj_matrices"]
     depth_values = sample_cuda["depth_values"]
-    
+    print("in mvsnet_inference:", imgs.shape, proj_matrices.shape, depth_values.shape)
     outputs = mvsnet(imgs, proj_matrices, depth_values)
     depth_mvs = outputs["depth"]
     conf_mvs = outputs["photometric_confidence"]
+    print("in mvsnet_inference:", conf_mvs.shape, depth_mvs.shape)
     
     return depth_mvs, conf_mvs
 
@@ -294,13 +291,11 @@ def train_sample(sample, detailed_summary=False):
     da3_depth = sample_cuda["da3_depth"]
     da3_conf = sample_cuda["da3_conf"]
     B, Hm, Wm = depth_mvs.shape
-
     da3_depth, da3_conf = resize_da3_to_mvs(
         da3_depth,
         da3_conf,
         target_hw=(Hm, Wm)
     )
-    
     depth_gt = sample_cuda["depth"]
     depth_gt, mask = resize_da3_to_mvs(
         depth_gt,
@@ -308,15 +303,15 @@ def train_sample(sample, detailed_summary=False):
         target_hw=(Hm, Wm)
     )
     mask = mask > 0.5
-
     # Handle missing DA3 data
     if da3_depth is None:
         da3_depth = depth_mvs.clone().detach()
     if da3_conf is None:
         da3_conf = conf_mvs.clone().detach()
+    depth_values = sample_cuda["depth_values"]
+    print("shapes:", depth_mvs.shape, conf_mvs.shape, da3_depth.shape, da3_conf.shape, depth_gt.shape,depth_values.shape)
     
     # Ensure all inputs have batch dimension
-    depth_values = sample_cuda["depth_values"]
     
     # 修复：为每个batch样本计算各自的深度范围
     depth_mvs = ensure_4d(depth_mvs)
@@ -324,9 +319,11 @@ def train_sample(sample, detailed_summary=False):
     da3_depth = ensure_4d(da3_depth)
     da3_conf  = ensure_4d(da3_conf)
     depth_values = depth_values.unsqueeze(1)
+    print("shapes:", depth_mvs.shape, conf_mvs.shape, da3_depth.shape, da3_conf.shape, depth_gt.shape,depth_values.shape)
     
     # Fusion model forward
     prob, conf_fused = fusion_model(depth_mvs, conf_mvs, da3_depth, da3_conf)
+    print("fusionshapes:", prob.shape, conf_fused.shape)
     K = prob.shape[1]  # 64
     
     # 修复：为每个batch样本计算各自的深度区间
@@ -342,12 +339,11 @@ def train_sample(sample, detailed_summary=False):
             device=prob.device
         )
         depth_bins.append(bins)
-    
     depth_bins = torch.stack(depth_bins, dim=0)  # (B, K)
     
     # Compute loss
-    print("shape:", prob.shape, depth_gt.shape, depth_bins.shape)
-    loss = depth_bin_loss(prob, depth_gt, depth_bins)
+    print("before cal loss, shape:", prob.shape, depth_gt.shape, depth_bins.shape,mask.shape)
+    loss = depth_bin_loss(prob, depth_gt, depth_bins, mask)
     
     loss.backward()
     optimizer.step()
@@ -363,6 +359,7 @@ def train_sample(sample, detailed_summary=False):
         "depth_fused": depth_fused * mask,
         "depth_gt": depth_gt,
         "depth_da3": da3_depth * mask.unsqueeze(1),
+        "conf_da3": da3_conf ,
         "conf_mvs": conf_mvs,
         "conf_fused": conf_fused,
     }
@@ -453,16 +450,16 @@ def train():
         lr_scheduler.step()
         global_step = len(TrainImgLoader) * epoch_idx
         
-        # if epoch_idx == start_reverse_epoch:
-        #     print("=> Start using reverse view selection for training")
-        train_dataset.set_pair_reverse_model(True, N=3)
+        if epoch_idx == start_reverse_epoch:
+            print("=> Start using reverse view selection for training")
+            train_dataset.set_pair_reverse_model(True, N=3)
         # Training
         for batch_idx, sample in enumerate(TrainImgLoader):
             start_time = time.time()
             global_step = len(TrainImgLoader) * epoch_idx + batch_idx
             do_summary = global_step % args.summary_freq == 0
             
-            loss, scalar_outputs, image_outputs = train_sample(sample, detailed_summary=do_summary)
+            loss, scalar_outputs, image_outputs = train_sample(sample, detailed_summary=do_summary) # scalar是标量的意思
             
             if do_summary:
                 save_scalars(logger, 'train', scalar_outputs, global_step)
