@@ -3,4 +3,7 @@ outputs
 *.bin
 checkpoints
 __pycache__
+events.out.tfevents.*
+*.pyc
+
 

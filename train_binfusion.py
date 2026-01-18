@@ -190,25 +190,28 @@ def depth_to_bins(depth_gt, depth_values, num_bins):
     
     return bin_indices
 
-
-def depth_from_prob(prob, depth_values):
+def depth_from_prob(prob, depth_bins):
     """Estimate depth from probability distribution"""
     # prob: (B, num_bins, H, W)
-    # depth_values: (B, num_depths)
+    # depth_bins: (B, num_bins)
     B, num_bins, H, W = prob.shape
     
-    # Interpolate depth values to bins
-    depth_min = depth_values[:, 0].view(B, 1, 1)
-    depth_max = depth_values[:, -1].view(B, 1, 1)
-    bin_depths = torch.linspace(0, 1, num_bins, device=prob.device).view(1, num_bins, 1, 1)
-    bin_depths = depth_min + (depth_max - depth_min) * bin_depths
+    # 确保 depth_bins 有正确的形状用于广播
+    if depth_bins.dim() == 2:
+        # depth_bins: (B, num_bins) -> (B, num_bins, 1, 1)
+        depth_bins_expanded = depth_bins.view(B, num_bins, 1, 1)
+    else:
+        # 如果已经是 (B, num_bins, 1, 1) 或类似形状
+        depth_bins_expanded = depth_bins
     
-    # Compute expected depth
-    prob_soft = prob.softmax(dim=1)  # Normalize
-    depth_est = (prob_soft * bin_depths).sum(dim=1)
+    # 使用实际的深度区间而不是线性插值
+    # depth_bins_expanded 已经是每个bin的实际深度值
+    
+    # 计算期望深度（期望值）
+    prob_soft = F.softmax(prob, dim=1)  # 归一化概率分布
+    depth_est = (prob_soft * depth_bins_expanded).sum(dim=1)
     
     return depth_est
-
 
 @torch.no_grad()
 def mvsnet_inference(sample):
@@ -225,14 +228,63 @@ def mvsnet_inference(sample):
     return depth_mvs, conf_mvs
 
 
+def resize_da3_to_mvs(da3_depth, da3_conf, target_hw):
+    """
+    da3_depth: [B, H, W]
+    da3_conf : [B, H, W]
+    target_hw: (H_t, W_t)
+    return:
+        da3_depth_rs: [B, H_t, W_t]
+        da3_conf_rs : [B, H_t, W_t]
+    """
+    H_t, W_t = target_hw
+
+    # [B, H, W] -> [B, 1, H, W]
+    da3_depth = da3_depth.unsqueeze(1)
+    da3_conf  = da3_conf.unsqueeze(1)
+
+    da3_depth_rs = F.interpolate(
+        da3_depth,
+        size=(H_t, W_t),
+        mode="bilinear",
+        align_corners=False
+    )
+
+    da3_conf_rs = F.interpolate(
+        da3_conf,
+        size=(H_t, W_t),
+        mode="bilinear",
+        align_corners=False
+    )
+
+    # back to [B, H, W]
+    da3_depth_rs = da3_depth_rs.squeeze(1)
+    da3_conf_rs  = da3_conf_rs.squeeze(1)
+
+    return da3_depth_rs, da3_conf_rs
+def ensure_4d(x):
+    """
+    Ensure tensor shape is (B, 1, H, W)
+    """
+    if x.dim() == 2:
+        # (H, W)
+        x = x.unsqueeze(0).unsqueeze(0)
+    elif x.dim() == 3:
+        # (B, H, W)
+        x = x.unsqueeze(1)
+    elif x.dim() == 4:
+        # already OK
+        pass
+    else:
+        raise ValueError(f"Invalid tensor shape: {x.shape}")
+    return x
+
 def train_sample(sample, detailed_summary=False):
     """Train one sample"""
     fusion_model.train()
     optimizer.zero_grad()
     
     sample_cuda = tocuda(sample)
-    depth_gt = sample_cuda["depth"]
-    mask = sample_cuda["mask"] > 0.5
     
     # MVSNet inference (frozen)
     with torch.no_grad():
@@ -241,7 +293,22 @@ def train_sample(sample, detailed_summary=False):
     # Get DA3 depth and confidence
     da3_depth = sample_cuda["da3_depth"]
     da3_conf = sample_cuda["da3_conf"]
+    B, Hm, Wm = depth_mvs.shape
+
+    da3_depth, da3_conf = resize_da3_to_mvs(
+        da3_depth,
+        da3_conf,
+        target_hw=(Hm, Wm)
+    )
     
+    depth_gt = sample_cuda["depth"]
+    depth_gt, mask = resize_da3_to_mvs(
+        depth_gt,
+        sample_cuda["mask"],
+        target_hw=(Hm, Wm)
+    )
+    mask = mask > 0.5
+
     # Handle missing DA3 data
     if da3_depth is None:
         da3_depth = depth_mvs.clone().detach()
@@ -249,31 +316,46 @@ def train_sample(sample, detailed_summary=False):
         da3_conf = conf_mvs.clone().detach()
     
     # Ensure all inputs have batch dimension
-    if len(depth_mvs.shape) == 3:
-        depth_mvs = depth_mvs.unsqueeze(0)
-    if len(conf_mvs.shape) == 3:
-        conf_mvs = conf_mvs.unsqueeze(0)
-    if len(da3_depth.shape) == 3:
-        da3_depth = da3_depth.unsqueeze(0)
-    if len(da3_conf.shape) == 3:
-        da3_conf = da3_conf.unsqueeze(0)
+    depth_values = sample_cuda["depth_values"]
+    
+    # 修复：为每个batch样本计算各自的深度范围
+    depth_mvs = ensure_4d(depth_mvs)
+    conf_mvs  = ensure_4d(conf_mvs)
+    da3_depth = ensure_4d(da3_depth)
+    da3_conf  = ensure_4d(da3_conf)
+    depth_values = depth_values.unsqueeze(1)
     
     # Fusion model forward
     prob, conf_fused = fusion_model(depth_mvs, conf_mvs, da3_depth, da3_conf)
+    K = prob.shape[1]  # 64
     
-    # Generate depth bins for GT
-    depth_values = sample_cuda["depth_values"]
-    bin_indices = depth_to_bins(depth_gt, depth_values, args.num_bins)
+    # 修复：为每个batch样本计算各自的深度区间
+    depth_bins = []
+    for b in range(B):
+        mask_b = mask[b] if mask.dim() > 1 else mask
+        depth_min = depth_gt[b][mask_b].min()
+        depth_max = depth_gt[b][mask_b].max()
+        bins = torch.linspace(
+            depth_min,
+            depth_max,
+            K,
+            device=prob.device
+        )
+        depth_bins.append(bins)
+    
+    depth_bins = torch.stack(depth_bins, dim=0)  # (B, K)
     
     # Compute loss
-    loss = depth_bin_loss(prob, depth_gt, depth_values)
+    print("shape:", prob.shape, depth_gt.shape, depth_bins.shape)
+    loss = depth_bin_loss(prob, depth_gt, depth_bins)
     
     loss.backward()
     optimizer.step()
     
     # Get fused depth for visualization
     with torch.no_grad():
-        depth_fused = depth_from_prob(prob, depth_values)
+        print("depth_bins:", depth_bins.shape)
+        depth_fused = depth_from_prob(prob, depth_bins)
     
     scalar_outputs = {"loss": loss}
     image_outputs = {
@@ -292,7 +374,6 @@ def train_sample(sample, detailed_summary=False):
             scalar_outputs["rmse"] = torch.sqrt((depth_error ** 2).mean())
     
     return tensor2float(loss), tensor2float(scalar_outputs), image_outputs
-
 
 @torch.no_grad()
 def test_sample(sample, detailed_summary=True):
@@ -372,9 +453,9 @@ def train():
         lr_scheduler.step()
         global_step = len(TrainImgLoader) * epoch_idx
         
-        if epoch_idx == start_reverse_epoch:
-            print("=> Start using reverse view selection for training")
-            train_dataset.set_pair_reverse_model(True, N=3)
+        # if epoch_idx == start_reverse_epoch:
+        #     print("=> Start using reverse view selection for training")
+        train_dataset.set_pair_reverse_model(True, N=3)
         # Training
         for batch_idx, sample in enumerate(TrainImgLoader):
             start_time = time.time()
@@ -406,28 +487,28 @@ def train():
         
         # Testing
         print("\nTesting...")
-        avg_test_scalars = DictAverageMeter()
-        for batch_idx, sample in enumerate(TestImgLoader):
-            start_time = time.time()
-            do_summary = (batch_idx % args.summary_freq == 0)
+        # avg_test_scalars = DictAverageMeter()
+        # for batch_idx, sample in enumerate(TestImgLoader):
+        #     start_time = time.time()
+        #     do_summary = (batch_idx % args.summary_freq == 0)
             
-            loss, scalar_outputs, image_outputs = test_sample(sample, detailed_summary=do_summary)
+        #     loss, scalar_outputs, image_outputs = test_sample(sample, detailed_summary=do_summary)
             
-            if do_summary:
-                save_scalars(logger, 'test', scalar_outputs, global_step)
-                save_images(logger, 'test', image_outputs, global_step)
+        #     if do_summary:
+        #         save_scalars(logger, 'test', scalar_outputs, global_step)
+        #         save_images(logger, 'test', image_outputs, global_step)
             
-            avg_test_scalars.update(scalar_outputs)
-            del scalar_outputs, image_outputs
+        #     avg_test_scalars.update(scalar_outputs)
+        #     del scalar_outputs, image_outputs
             
-            print(
-                f'Epoch {epoch_idx}/{args.epochs}, Iter {batch_idx}/{len(TestImgLoader)}, '
-                f'test loss = {loss:.6f}, time = {time.time() - start_time:.3f}s'
-            )
+        #     print(
+        #         f'Epoch {epoch_idx}/{args.epochs}, Iter {batch_idx}/{len(TestImgLoader)}, '
+        #         f'test loss = {loss:.6f}, time = {time.time() - start_time:.3f}s'
+        #     )
         
-        # Log average test metrics
-        save_scalars(logger, 'test_avg', avg_test_scalars.mean(), epoch_idx)
-        print(f"\nAverage test metrics: {avg_test_scalars.mean()}")
+        # # Log average test metrics
+        # save_scalars(logger, 'test_avg', avg_test_scalars.mean(), epoch_idx)
+        # print(f"\nAverage test metrics: {avg_test_scalars.mean()}")
 
 
 def test():

@@ -102,9 +102,13 @@ def homo_warping(src_fea, src_proj, ref_proj, depth_values):
     batch, channels = src_fea.shape[0], src_fea.shape[1]
     num_depth = depth_values.shape[1]
     height, width = src_fea.shape[2], src_fea.shape[3]
-
+    # 这种代码不支持datapara
     with torch.no_grad():
-        proj = torch.matmul(src_proj, torch.inverse(ref_proj))
+        ref_proj_inv = ref_proj.detach().clone()
+        ref_proj_inv = torch.inverse(ref_proj_inv)
+    proj = torch.matmul(src_proj, ref_proj_inv)
+    with torch.no_grad():
+        # proj = torch.matmul(src_proj, torch.inverse(ref_proj))
         rot = proj[:, :3, :3]  # [B,3,3]
         trans = proj[:, :3, 3:4]  # [B,3,1]
 

@@ -45,16 +45,31 @@ class DepthBinFusionNet(nn.Module):
 
 def depth_bin_loss(prob, gt_depth, depth_bins):
     """
-    prob: (B,K,H,W)
+    prob: (B, K, H, W)
+    gt_depth: (B, H, W)
+    depth_bins: (B, K) or (1, K)
     """
     B, K, H, W = prob.shape
-
+    
+    # 确保 depth_bins 有正确的形状
+    if depth_bins.dim() == 2:
+        # depth_bins: (B, K) or (1, K)
+        # 如果是 (1, K) 且 B > 1，则广播到整个batch
+        if depth_bins.shape[0] == 1 and B > 1:
+            depth_bins = depth_bins.expand(B, -1)
+    
+    # 修正维度匹配问题
+    # gt_depth: (B, H, W) -> (B, 1, H, W)
+    # depth_bins: (B, K) -> (B, K, 1, 1)
+    # 这样广播后得到: (B, K, H, W)
+    gt_depth_expanded = gt_depth.unsqueeze(1)  # (B, 1, H, W)
+    depth_bins_expanded = depth_bins.view(B, K, 1, 1)  # (B, K, 1, 1)
+    
     # hard assignment
-    gt_bin = torch.argmin(
-        torch.abs(gt_depth - depth_bins.view(1, K, 1, 1)),
-        dim=1
-    )
-
+    # 计算每个像素点与每个深度区间的距离
+    dist = torch.abs(gt_depth_expanded - depth_bins_expanded)  # (B, K, H, W)
+    gt_bin = torch.argmin(dist, dim=1)  # (B, H, W)
+    
     loss_ce = F.cross_entropy(prob, gt_bin)
 
     # EMD regularization
